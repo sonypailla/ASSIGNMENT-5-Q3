@@ -2,6 +2,7 @@ pip install torch torchvision matplotlib
 
 # simple_gan_mnist.py
 
+!pip install torch torchvision matplotlib
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -32,8 +33,11 @@ dataset = datasets.MNIST(root='./data', train=True, transform=transform, downloa
 data_loader = DataLoader(dataset=dataset, batch_size=batch_size, shuffle=True)
 
 # Generator
+import torchvision
+# Define the Generator
 class Generator(nn.Module):
     def __init__(self):
+    def __init__(self, z_dim=100):
         super(Generator, self).__init__()
         self.main = nn.Sequential(
             nn.Linear(latent_size, hidden_size),
@@ -44,10 +48,23 @@ class Generator(nn.Module):
             nn.Tanh()
         )
 
+        self.fc1 = nn.Linear(z_dim, 256)
+        self.fc2 = nn.Linear(256, 512)
+        self.fc3 = nn.Linear(512, 1024)
+        self.fc4 = nn.Linear(1024, 28*28)
+        self.relu = nn.ReLU()
+        self.tanh = nn.Tanh()
+
     def forward(self, z):
         return self.main(z)
+        x = self.relu(self.fc1(z))
+        x = self.relu(self.fc2(x))
+        x = self.relu(self.fc3(x))
+        x = self.tanh(self.fc4(x))  # Output range is [-1, 1] for tanh activation
+        return x.view(-1, 1, 28, 28)
 
 # Discriminator
+# Define the Discriminator
 class Discriminator(nn.Module):
     def __init__(self):
         super(Discriminator, self).__init__()
@@ -62,12 +79,44 @@ class Discriminator(nn.Module):
 
     def forward(self, img):
         return self.main(img)
+        self.fc1 = nn.Linear(28*28, 1024)
+        self.fc2 = nn.Linear(1024, 512)
+        self.fc3 = nn.Linear(512, 256)
+        self.fc4 = nn.Linear(256, 1)
+        self.leaky_relu = nn.LeakyReLU(0.2)
+        self.sigmoid = nn.Sigmoid()
 
+    def forward(self, x):
+        x = x.view(-1, 28*28)
+        x = self.leaky_relu(self.fc1(x))
+        x = self.leaky_relu(self.fc2(x))
+        x = self.leaky_relu(self.fc3(x))
+        x = self.sigmoid(self.fc4(x))  # Output is between 0 and 1
+        return x
+# Hyperparameters
+z_dim = 100
+lr = 0.0002
+batch_size = 64
+epochs = 100
+
+# Prepare DataLoader for MNIST
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.5,), (0.5,))
+])
+train_loader = torch.utils.data.DataLoader(
+    datasets.MNIST('.', train=True, download=True, transform=transform),
+    batch_size=batch_size, shuffle=True
+)
 # Initialize models
 G = Generator().to(device)
 D = Discriminator().to(device)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+generator = Generator(z_dim).to(device)
+discriminator = Discriminator().to(device)
 
 # Loss and Optimizer
+# Loss and Optimizers
 criterion = nn.BCELoss()
 optimizer_G = optim.Adam(G.parameters(), lr=learning_rate)
 optimizer_D = optim.Adam(D.parameters(), lr=learning_rate)
@@ -102,26 +151,58 @@ for epoch in range(num_epochs + 1):
     for idx, (real_images, _) in enumerate(data_loader):
         real_images = real_images.reshape(batch_size, -1).to(device)
 
+optimizer_G = optim.Adam(generator.parameters(), lr=lr, betas=(0.5, 0.999))
+optimizer_D = optim.Adam(discriminator.parameters(), lr=lr, betas=(0.5, 0.999))
+
+# Function to generate images
+def generate_images(epoch, fixed_noise):
+    with torch.no_grad():
+        generated_images = generator(fixed_noise)
+        grid = torchvision.utils.make_grid(generated_images, nrow=8, normalize=True)
+        plt.imshow(grid.permute(1, 2, 0).cpu())
+        plt.title(f'Epoch {epoch}')
+        plt.show()
+
+# Training loop
+fixed_noise = torch.randn(64, z_dim).to(device)
+d_losses, g_losses = [], []
+for epoch in range(epochs):
+    for real_images, _ in train_loader:
+        real_images = real_images.to(device)
+        batch_size = real_images.size(0)
+
+        # Labels
         real_labels = torch.ones(batch_size, 1).to(device)
         fake_labels = torch.zeros(batch_size, 1).to(device)
 
         # ---------------------
+
         # Train Discriminator
         # ---------------------
         outputs = D(real_images)
+        optimizer_D.zero_grad()
+
+        outputs = discriminator(real_images)
         d_loss_real = criterion(outputs, real_labels)
+        d_loss_real.backward()
 
         z = torch.randn(batch_size, latent_size).to(device)
         fake_images = G(z)
         outputs = D(fake_images.detach())
+        z = torch.randn(batch_size, z_dim).to(device)
+        fake_images = generator(z)
+        outputs = discriminator(fake_images.detach())  # Detach to avoid updating generator
         d_loss_fake = criterion(outputs, fake_labels)
 
         d_loss = d_loss_real + d_loss_fake
         optimizer_D.zero_grad()
         d_loss.backward()
+        d_loss_fake.backward()
+
         optimizer_D.step()
 
         # ---------------------
+
         # Train Generator
         # ---------------------
         z = torch.randn(batch_size, latent_size).to(device)
@@ -130,7 +211,10 @@ for epoch in range(num_epochs + 1):
         g_loss = criterion(outputs, real_labels)
 
         optimizer_G.zero_grad()
+        outputs = discriminator(fake_images)
+        g_loss = criterion(outputs, real_labels)
         g_loss.backward()
+
         optimizer_G.step()
 
     # Save losses for plotting
@@ -151,7 +235,21 @@ plt.plot(G_losses, label="Generator Loss")
 plt.plot(D_losses, label="Discriminator Loss")
 plt.xlabel("Epoch")
 plt.ylabel("Loss")
+
+    # Print losses and save sample images at specific epochs
+    d_losses.append(d_loss_real.item() + d_loss_fake.item())
+    g_losses.append(g_loss.item())
+
+    if epoch == 0 or epoch == 50 or epoch == 100:
+        print(f'Epoch [{epoch}/{epochs}]  Loss D: {d_loss_real.item() + d_loss_fake.item()}, Loss G: {g_loss.item()}')
+        generate_images(epoch, fixed_noise)
+# After training
+plt.plot(d_losses, label='Discriminator Loss')
+plt.plot(g_losses, label='Generator Loss')
 plt.legend()
 plt.title("Generator vs Discriminator Loss During Training")
 plt.savefig('loss_plot.png')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Losses over Time')
 plt.show()
